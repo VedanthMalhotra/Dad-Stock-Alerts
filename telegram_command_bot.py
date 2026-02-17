@@ -8,6 +8,11 @@ Commands:
   /list                   - Show all alerts (for this chat)
   /remove ETERNAL         - Remove alert
   /help                   - Show help
+
+Behavior:
+- Alerts trigger ONCE (then become inactive)
+- /update re-activates an alert
+- /add ALWAYS adds, even if price feed is temporarily down
 """
 
 import time
@@ -29,7 +34,7 @@ class TelegramCommandBot:
         self.monitoring_active = False
         self.user_chat_ids = set()
 
-        # Simple thread-safety for alerts dict
+        # Thread-safety for shared dicts
         self.lock = threading.Lock()
 
     def send_message(self, chat_id: str, message: str) -> bool:
@@ -81,8 +86,12 @@ class TelegramCommandBot:
         return False
 
     def get_current_price(self, ticker: str):
+        """
+        Fetch current price from Yahoo Finance chart endpoint directly.
+        Tries intervals in order: 1m -> 5m -> 15m (fallbacks are more stable on cloud IPs).
+        """
         url = f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}"
-        params = {"range": "1d", "interval": "1m"}
+
         headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
                           "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
@@ -91,49 +100,53 @@ class TelegramCommandBot:
             "Connection": "keep-alive",
         }
 
-        for attempt in range(3):
-            try:
-                response = requests.get(url, params=params, headers=headers, timeout=20)
+        intervals = ["1m", "5m", "15m"]
 
-                if response.status_code != 200:
-                    print(f"Yahoo HTTP {response.status_code} for {ticker}")
+        for interval in intervals:
+            params = {"range": "1d", "interval": interval}
+
+            for attempt in range(3):
+                try:
+                    response = requests.get(url, params=params, headers=headers, timeout=20)
+
+                    if response.status_code != 200:
+                        print(f"Yahoo HTTP {response.status_code} for {ticker} interval={interval}")
+                        time.sleep(1 + attempt)
+                        continue
+
+                    if "application/json" not in response.headers.get("Content-Type", "").lower():
+                        print(f"Yahoo returned non-JSON for {ticker} interval={interval}")
+                        time.sleep(1 + attempt)
+                        continue
+
+                    data = response.json()
+                    result = data.get("chart", {}).get("result")
+                    if not result:
+                        print(f"No chart result for {ticker} interval={interval}")
+                        time.sleep(1 + attempt)
+                        continue
+
+                    quotes = result[0].get("indicators", {}).get("quote", [])
+                    if not quotes:
+                        print(f"No quote data for {ticker} interval={interval}")
+                        time.sleep(1 + attempt)
+                        continue
+
+                    closes = quotes[0].get("close", [])
+                    if not closes:
+                        print(f"No close series for {ticker} interval={interval}")
+                        time.sleep(1 + attempt)
+                        continue
+
+                    for price in reversed(closes):
+                        if price is not None:
+                            return round(float(price), 2)
+
                     time.sleep(1 + attempt)
-                    continue
 
-                if "application/json" not in response.headers.get("Content-Type", "").lower():
-                    print(f"Yahoo returned non-JSON for {ticker}")
+                except Exception as e:
+                    print(f"Error fetching price for {ticker} interval={interval}: {e}")
                     time.sleep(1 + attempt)
-                    continue
-
-                data = response.json()
-                result = data.get("chart", {}).get("result")
-                if not result:
-                    print(f"No chart result for {ticker}")
-                    time.sleep(1 + attempt)
-                    continue
-
-                quotes = result[0].get("indicators", {}).get("quote", [])
-                if not quotes:
-                    print(f"No quote data for {ticker}")
-                    time.sleep(1 + attempt)
-                    continue
-
-                closes = quotes[0].get("close", [])
-                if not closes:
-                    print(f"No close series for {ticker}")
-                    time.sleep(1 + attempt)
-                    continue
-
-                for price in reversed(closes):
-                    if price is not None:
-                        return round(float(price), 2)
-
-                print(f"All close values were None for {ticker}")
-                time.sleep(1 + attempt)
-
-            except Exception as e:
-                print(f"Error fetching price for {ticker}: {e}")
-                time.sleep(1 + attempt)
 
         return None
 
@@ -155,8 +168,8 @@ class TelegramCommandBot:
             lower_price = alert_data["lower_price"]
             chat_id = alert_data["chat_id"]
 
-            # Upper breach -> trigger ONCE and then deactivate
-            if current_price >= upper_price and not self.alert_sent[stock_symbol]["upper_sent"]:
+            # Upper breach -> trigger ONCE then deactivate
+            if current_price >= upper_price and not self.alert_sent.get(stock_symbol, {}).get("upper_sent", False):
                 msg = (
                     f"🚨 <b>PRICE ALERT - UPPER BREACH</b> 🚨\n\n"
                     f"Stock: <b>{stock_symbol}</b>\n"
@@ -172,8 +185,8 @@ class TelegramCommandBot:
                     if stock_symbol in self.alerts:
                         self.alerts[stock_symbol]["active"] = False  # ✅ deactivate after trigger
 
-            # Lower breach -> trigger ONCE and then deactivate
-            elif current_price <= lower_price and not self.alert_sent[stock_symbol]["lower_sent"]:
+            # Lower breach -> trigger ONCE then deactivate
+            elif current_price <= lower_price and not self.alert_sent.get(stock_symbol, {}).get("lower_sent", False):
                 msg = (
                     f"🚨 <b>PRICE ALERT - LOWER BREACH</b> 🚨\n\n"
                     f"Stock: <b>{stock_symbol}</b>\n"
@@ -200,7 +213,6 @@ class TelegramCommandBot:
                 has_active = any(a.get("active") for a in self.alerts.values())
 
             if not has_active:
-                # Keep process alive; users can add new alerts anytime
                 time.sleep(5)
                 continue
 
@@ -230,12 +242,13 @@ class TelegramCommandBot:
                 "💡 /help - Show this message\n\n"
                 "<b>How alerts work:</b>\n"
                 "• Each alert triggers ONCE, then becomes inactive\n"
-                "• Use /update (or /add again) to reactivate with new limits"
+                "• Use /update to reactivate with new limits\n"
+                "• /add always works even if price feed is temporarily down"
             )
             self.send_message(chat_id, help_text)
             return
 
-        # /add STOCK LOWER UPPER
+        # /add STOCK LOWER UPPER  (ALWAYS adds even if test price fails)
         if message_text.startswith("/add"):
             parts = message_text.split()
             if len(parts) != 4:
@@ -252,25 +265,37 @@ class TelegramCommandBot:
                     return
 
                 test_price = self.get_current_price(f"{stock}.NS")
-                if test_price is None:
-                    self.send_message(chat_id, f"⚠️ Could not fetch price for {stock}. Check the NSE symbol.")
-                    return
 
+                # ✅ Always add
                 self.add_alert(chat_id, stock, lower, upper)
-                self.send_message(
-                    chat_id,
-                    f"✅ <b>Alert Added!</b>\n\n"
-                    f"Stock: {stock}\n"
-                    f"Current Price: ₹{test_price}\n"
-                    f"Lower Limit: ₹{lower}\n"
-                    f"Upper Limit: ₹{upper}\n\n"
-                    f"Note: If current price is already outside the range, it may trigger immediately."
-                )
+
+                if test_price is None:
+                    self.send_message(
+                        chat_id,
+                        f"✅ <b>Alert Added!</b>\n\n"
+                        f"Stock: {stock}\n"
+                        f"Lower Limit: ₹{lower}\n"
+                        f"Upper Limit: ₹{upper}\n\n"
+                        f"⚠️ Price feed is temporarily unavailable (Yahoo).\n"
+                        f"The bot will keep checking and will alert when data is available.\n\n"
+                        f"Note: If price is already outside the range, it may trigger immediately once data returns."
+                    )
+                else:
+                    self.send_message(
+                        chat_id,
+                        f"✅ <b>Alert Added!</b>\n\n"
+                        f"Stock: {stock}\n"
+                        f"Current Price: ₹{test_price}\n"
+                        f"Lower Limit: ₹{lower}\n"
+                        f"Upper Limit: ₹{upper}\n\n"
+                        f"Note: If current price is already outside the range, it may trigger immediately."
+                    )
+
             except ValueError:
                 self.send_message(chat_id, "❌ Prices must be numbers.\nExample: /add INFY 1450 1550")
             return
 
-        # /update STOCK LOWER UPPER
+        # /update STOCK LOWER UPPER (reactivates)
         if message_text.startswith("/update"):
             parts = message_text.split()
             if len(parts) != 4:
@@ -306,6 +331,7 @@ class TelegramCommandBot:
                     f"New Upper Limit: ₹{upper}\n"
                     f"Status: Active"
                 )
+
             except ValueError:
                 self.send_message(chat_id, "❌ Prices must be numbers.\nExample: /update INFY 1440 1560")
             return
@@ -329,6 +355,7 @@ class TelegramCommandBot:
                     f"Current: {'₹' + str(cur) if cur is not None else 'N/A'}\n"
                     f"Range: ₹{a['lower_price']} - ₹{a['upper_price']}\n\n"
                 )
+
             self.send_message(chat_id, out)
             return
 
