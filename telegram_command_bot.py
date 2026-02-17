@@ -81,14 +81,64 @@ class TelegramCommandBot:
         return False
 
     def get_current_price(self, ticker: str):
-        """Fetch current price from yfinance"""
-        try:
-            stock = yf.Ticker(ticker)
-            data = stock.history(period="1d")
-            if not data.empty:
-                return round(float(data["Close"].iloc[-1]), 2)
-        except Exception as e:
-            print(f"Error fetching price for {ticker}: {e}")
+    """
+    Fetch current price from Yahoo Finance chart endpoint directly.
+    Example ticker: 'INFY.NS'
+    """
+    url = f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}"
+    params = {
+        "range": "1d",
+        "interval": "1m"
+    }
+
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                      "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept": "application/json,text/plain,*/*",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Connection": "keep-alive",
+    }
+
+    try:
+        response = requests.get(
+            url,
+            params=params,
+            headers=headers,
+            timeout=20
+        )
+
+        if response.status_code != 200:
+            print(f"Yahoo HTTP {response.status_code} for {ticker}")
+            return None
+
+        if "application/json" not in response.headers.get("Content-Type", "").lower():
+            print(f"Yahoo returned non-JSON for {ticker}")
+            return None
+
+        data = response.json()
+        result = data.get("chart", {}).get("result")
+
+        if not result:
+            print(f"No chart result for {ticker}")
+            return None
+
+        quotes = result[0].get("indicators", {}).get("quote", [])
+
+        if not quotes:
+            print(f"No quote data for {ticker}")
+            return None
+
+        closes = quotes[0].get("close", [])
+
+        # Return last non-null close
+        for price in reversed(closes):
+            if price is not None:
+                return round(float(price), 2)
+
+        return None
+
+    except Exception as e:
+        print(f"Error fetching price for {ticker}: {e}")
         return None
 
     def check_alerts(self) -> None:
