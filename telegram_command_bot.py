@@ -49,7 +49,11 @@ class TelegramCommandBot:
 
     def get_updates(self):
         url = f"https://api.telegram.org/bot{self.bot_token}/getUpdates"
-        params = {"offset": self.last_update_id + 1, "timeout": 30}
+        params = {
+          "offset": self.last_update_id + 1,
+          "timeout": 30,
+          "allowed_updates": ["message"]
+        }
         try:
             r = requests.get(url, params=params, timeout=35)
             if r.status_code == 200:
@@ -437,6 +441,12 @@ def main():
     print("   2) Send /start")
     print("   3) Send /add INFY 1450 1550")
     print("\n" + "=" * 60 + "\n")
+
+    # Drop any pending updates on startup to prevent duplicate processing
+    requests.get(
+      f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates",
+      params={"offset": -1}
+    )
 
     bot.run()
 
