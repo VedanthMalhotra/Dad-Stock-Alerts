@@ -85,7 +85,7 @@ class TelegramCommandBot:
         """Fetch current price from yfinance"""
         try:
             stock = yf.Ticker(ticker)
-            data = stock.history(period="1d", interval="1m")
+            data = stock.history(period="1d")
             if not data.empty:
                 return round(float(data["Close"].iloc[-1]), 2)
         except Exception as e:
