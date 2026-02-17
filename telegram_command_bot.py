@@ -447,7 +447,7 @@ def main():
     print("NSE STOCK ALERT BOT - TELEGRAM COMMAND MODE")
     print("=" * 60)
 
-    TELEGRAM_BOT_TOKEN = "8093483580:AAFD2CH7iEmNTF-Cf3OPF45X9ecmpbBqjN0"
+    TELEGRAM_BOT_TOKEN = "8093483580:AAG0P1pN576z4OgP_CdeUxFsZfgS6OfW5wQ"
 
     if TELEGRAM_BOT_TOKEN.strip() == "" or TELEGRAM_BOT_TOKEN == "PASTE_YOUR_REAL_TOKEN_HERE":
         print("\n❌ ERROR: Paste your real bot token in TELEGRAM_BOT_TOKEN.")
