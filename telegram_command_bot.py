@@ -3,18 +3,19 @@ NSE Stock Alert Bot with Telegram Commands
 Your dad can control everything by just messaging the bot!
 
 Commands:
-  /add ETERNAL 275 300   - Add alert for ETERNAL stock
+  /add ETERNAL 275 300    - Add alert for ETERNAL stock
   /update ETERNAL 270 305 - Update alert thresholds
-  /list                  - Show all active alerts (for this chat)
+  /list                   - Show all active alerts (for this chat)
   /remove ETERNAL         - Remove alert
-  /help                  - Show help
+  /help                   - Show help
 """
 
-import requests
 import time
 import threading
 from datetime import datetime
 from typing import Dict
+
+import requests
 from flask import Flask
 
 
@@ -50,6 +51,7 @@ class TelegramCommandBot:
                 return r.json().get("result", [])
         except Exception as e:
             print(f"Error getting updates: {e}")
+
         return []
 
     def add_alert(self, chat_id: str, stock_symbol: str, lower_price: float, upper_price: float) -> None:
@@ -81,64 +83,68 @@ class TelegramCommandBot:
         return False
 
     def get_current_price(self, ticker: str):
-    """
-    Fetch current price from Yahoo Finance chart endpoint directly.
-    Example ticker: 'INFY.NS'
-    """
-    url = f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}"
-    params = {
-        "range": "1d",
-        "interval": "1m"
-    }
+        """
+        Fetch current price from Yahoo Finance chart endpoint directly.
+        Example ticker: 'INFY.NS'
+        """
+        url = f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}"
+        params = {"range": "1d", "interval": "1m"}
 
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                      "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        "Accept": "application/json,text/plain,*/*",
-        "Accept-Language": "en-US,en;q=0.9",
-        "Connection": "keep-alive",
-    }
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                          "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Accept": "application/json,text/plain,*/*",
+            "Accept-Language": "en-US,en;q=0.9",
+            "Connection": "keep-alive",
+        }
 
-    try:
-        response = requests.get(
-            url,
-            params=params,
-            headers=headers,
-            timeout=20
-        )
+        # Retry a few times (Yahoo can be flaky on cloud IPs)
+        for attempt in range(3):
+            try:
+                response = requests.get(url, params=params, headers=headers, timeout=20)
 
-        if response.status_code != 200:
-            print(f"Yahoo HTTP {response.status_code} for {ticker}")
-            return None
+                if response.status_code != 200:
+                    print(f"Yahoo HTTP {response.status_code} for {ticker}")
+                    time.sleep(1 + attempt)
+                    continue
 
-        if "application/json" not in response.headers.get("Content-Type", "").lower():
-            print(f"Yahoo returned non-JSON for {ticker}")
-            return None
+                if "application/json" not in response.headers.get("Content-Type", "").lower():
+                    print(f"Yahoo returned non-JSON for {ticker}")
+                    time.sleep(1 + attempt)
+                    continue
 
-        data = response.json()
-        result = data.get("chart", {}).get("result")
+                data = response.json()
+                result = data.get("chart", {}).get("result")
 
-        if not result:
-            print(f"No chart result for {ticker}")
-            return None
+                if not result:
+                    print(f"No chart result for {ticker}")
+                    time.sleep(1 + attempt)
+                    continue
 
-        quotes = result[0].get("indicators", {}).get("quote", [])
+                quotes = result[0].get("indicators", {}).get("quote", [])
+                if not quotes:
+                    print(f"No quote data for {ticker}")
+                    time.sleep(1 + attempt)
+                    continue
 
-        if not quotes:
-            print(f"No quote data for {ticker}")
-            return None
+                closes = quotes[0].get("close", [])
+                if not closes:
+                    print(f"No close series for {ticker}")
+                    time.sleep(1 + attempt)
+                    continue
 
-        closes = quotes[0].get("close", [])
+                # Return last non-null close
+                for price in reversed(closes):
+                    if price is not None:
+                        return round(float(price), 2)
 
-        # Return last non-null close
-        for price in reversed(closes):
-            if price is not None:
-                return round(float(price), 2)
+                print(f"All close values were None for {ticker}")
+                time.sleep(1 + attempt)
 
-        return None
+            except Exception as e:
+                print(f"Error fetching price for {ticker}: {e}")
+                time.sleep(1 + attempt)
 
-    except Exception as e:
-        print(f"Error fetching price for {ticker}: {e}")
         return None
 
     def check_alerts(self) -> None:
@@ -217,12 +223,12 @@ class TelegramCommandBot:
                 "🤖 <b>NSE Stock Alert Bot</b>\n\n"
                 "<b>Commands:</b>\n"
                 "➕ /add STOCK LOWER UPPER\n"
-                "   Example: /add ETERNAL 275 300\n\n"
+                "   Example: /add INFY 1450 1550\n\n"
                 "✏️ /update STOCK LOWER UPPER\n"
-                "   Example: /update ETERNAL 270 305\n\n"
+                "   Example: /update INFY 1440 1560\n\n"
                 "📋 /list - Show all your alerts\n"
                 "❌ /remove STOCK - Remove an alert\n"
-                "   Example: /remove ETERNAL\n\n"
+                "   Example: /remove INFY\n\n"
                 "💡 /help - Show this message\n\n"
                 "<b>Notes:</b>\n"
                 "• Uses NSE symbols (e.g., RELIANCE, TCS, INFY)\n"
@@ -236,12 +242,14 @@ class TelegramCommandBot:
         if message_text.startswith("/add"):
             parts = message_text.split()
             if len(parts) != 4:
-                self.send_message(chat_id, "❌ Use: /add STOCK LOWER UPPER\nExample: /add ETERNAL 275 300")
+                self.send_message(chat_id, "❌ Use: /add STOCK LOWER UPPER\nExample: /add INFY 1450 1550")
                 return
+
             try:
                 stock = parts[1].upper()
                 lower = float(parts[2])
                 upper = float(parts[3])
+
                 if lower >= upper:
                     self.send_message(chat_id, "❌ Lower price must be less than upper price!")
                     return
@@ -261,19 +269,21 @@ class TelegramCommandBot:
                     f"Upper Limit: ₹{upper}",
                 )
             except ValueError:
-                self.send_message(chat_id, "❌ Prices must be numbers.\nExample: /add ETERNAL 275 300")
+                self.send_message(chat_id, "❌ Prices must be numbers.\nExample: /add INFY 1450 1550")
             return
 
         # /update STOCK LOWER UPPER
         if message_text.startswith("/update"):
             parts = message_text.split()
             if len(parts) != 4:
-                self.send_message(chat_id, "❌ Use: /update STOCK LOWER UPPER\nExample: /update ETERNAL 270 305")
+                self.send_message(chat_id, "❌ Use: /update STOCK LOWER UPPER\nExample: /update INFY 1440 1560")
                 return
+
             try:
                 stock = parts[1].upper()
                 lower = float(parts[2])
                 upper = float(parts[3])
+
                 if lower >= upper:
                     self.send_message(chat_id, "❌ Lower price must be less than upper price!")
                     return
@@ -296,7 +306,7 @@ class TelegramCommandBot:
                     f"New Upper Limit: ₹{upper}",
                 )
             except ValueError:
-                self.send_message(chat_id, "❌ Prices must be numbers.\nExample: /update ETERNAL 270 305")
+                self.send_message(chat_id, "❌ Prices must be numbers.\nExample: /update INFY 1440 1560")
             return
 
         # /list
@@ -321,7 +331,7 @@ class TelegramCommandBot:
         if message_text.startswith("/remove"):
             parts = message_text.split()
             if len(parts) != 2:
-                self.send_message(chat_id, "❌ Use: /remove STOCK\nExample: /remove ETERNAL")
+                self.send_message(chat_id, "❌ Use: /remove STOCK\nExample: /remove INFY")
                 return
 
             stock = parts[1].upper()
@@ -337,6 +347,7 @@ class TelegramCommandBot:
     def run(self) -> None:
         """Main bot loop"""
         print("🤖 Bot started! Send /help to the bot on Telegram.\n")
+
         while True:
             try:
                 updates = self.get_updates()
@@ -371,7 +382,6 @@ def start_web_server():
     def home():
         return "OK", 200
 
-    # Railway provides PORT; default for local testing
     import os
     port = int(os.environ.get("PORT", "8080"))
     app.run(host="0.0.0.0", port=port)
@@ -398,7 +408,7 @@ def main():
     print("\n📱 Telegram steps:")
     print("   1) Open your bot")
     print("   2) Send /start")
-    print("   3) Send /add ETERNAL 275 300")
+    print("   3) Send /add INFY 1450 1550")
     print("\n" + "=" * 60 + "\n")
 
     bot.run()
