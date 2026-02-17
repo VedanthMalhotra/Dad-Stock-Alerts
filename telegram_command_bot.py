@@ -5,7 +5,7 @@ Your dad can control everything by just messaging the bot!
 Commands:
   /add ETERNAL 275 300    - Add alert for ETERNAL stock
   /update ETERNAL 270 305 - Update alert thresholds
-  /list                   - Show all active alerts (for this chat)
+  /list                   - Show all alerts (for this chat)
   /remove ETERNAL         - Remove alert
   /help                   - Show help
 """
@@ -25,14 +25,16 @@ class TelegramCommandBot:
         self.alerts: Dict[str, Dict] = {}
         self.alert_sent: Dict[str, Dict] = {}
         self.last_update_id = 0
+
         self.monitoring_active = False
         self.user_chat_ids = set()
 
+        # Simple thread-safety for alerts dict
+        self.lock = threading.Lock()
+
     def send_message(self, chat_id: str, message: str) -> bool:
-        """Send message to specific chat"""
         url = f"https://api.telegram.org/bot{self.bot_token}/sendMessage"
         payload = {"chat_id": chat_id, "text": message, "parse_mode": "HTML"}
-
         try:
             r = requests.post(url, json=payload, timeout=20)
             return r.status_code == 200
@@ -41,55 +43,46 @@ class TelegramCommandBot:
             return False
 
     def get_updates(self):
-        """Get new messages from Telegram (long polling)"""
         url = f"https://api.telegram.org/bot{self.bot_token}/getUpdates"
         params = {"offset": self.last_update_id + 1, "timeout": 30}
-
         try:
             r = requests.get(url, params=params, timeout=35)
             if r.status_code == 200:
                 return r.json().get("result", [])
         except Exception as e:
             print(f"Error getting updates: {e}")
-
         return []
 
     def add_alert(self, chat_id: str, stock_symbol: str, lower_price: float, upper_price: float) -> None:
-        """Add a price alert"""
         sym = stock_symbol.upper()
         ticker = f"{sym}.NS"
 
-        self.alerts[sym] = {
-            "ticker": ticker,
-            "upper_price": upper_price,
-            "lower_price": lower_price,
-            "chat_id": chat_id,
-            "active": True,
-        }
-
-        self.alert_sent[sym] = {"upper_sent": False, "lower_sent": False}
+        with self.lock:
+            self.alerts[sym] = {
+                "ticker": ticker,
+                "upper_price": upper_price,
+                "lower_price": lower_price,
+                "chat_id": chat_id,
+                "active": True,  # active until it triggers once
+            }
+            self.alert_sent[sym] = {"upper_sent": False, "lower_sent": False}
 
         if not self.monitoring_active:
             self.start_monitoring_thread()
 
-    def remove_alert(self, stock_symbol: str) -> bool:
-        """Remove a price alert"""
+    def remove_alert(self, chat_id: str, stock_symbol: str) -> bool:
         sym = stock_symbol.upper()
-        if sym in self.alerts:
-            del self.alerts[sym]
-            if sym in self.alert_sent:
-                del self.alert_sent[sym]
-            return True
+        with self.lock:
+            if sym in self.alerts and self.alerts[sym].get("chat_id") == chat_id:
+                del self.alerts[sym]
+                if sym in self.alert_sent:
+                    del self.alert_sent[sym]
+                return True
         return False
 
     def get_current_price(self, ticker: str):
-        """
-        Fetch current price from Yahoo Finance chart endpoint directly.
-        Example ticker: 'INFY.NS'
-        """
         url = f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}"
         params = {"range": "1d", "interval": "1m"}
-
         headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
                           "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
@@ -98,7 +91,6 @@ class TelegramCommandBot:
             "Connection": "keep-alive",
         }
 
-        # Retry a few times (Yahoo can be flaky on cloud IPs)
         for attempt in range(3):
             try:
                 response = requests.get(url, params=params, headers=headers, timeout=20)
@@ -115,7 +107,6 @@ class TelegramCommandBot:
 
                 data = response.json()
                 result = data.get("chart", {}).get("result")
-
                 if not result:
                     print(f"No chart result for {ticker}")
                     time.sleep(1 + attempt)
@@ -133,7 +124,6 @@ class TelegramCommandBot:
                     time.sleep(1 + attempt)
                     continue
 
-                # Return last non-null close
                 for price in reversed(closes):
                     if price is not None:
                         return round(float(price), 2)
@@ -148,10 +138,12 @@ class TelegramCommandBot:
         return None
 
     def check_alerts(self) -> None:
-        """Check all alerts and send notifications"""
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-        for stock_symbol, alert_data in list(self.alerts.items()):
+        with self.lock:
+            snapshot = list(self.alerts.items())
+
+        for stock_symbol, alert_data in snapshot:
             if not alert_data.get("active", False):
                 continue
 
@@ -163,7 +155,7 @@ class TelegramCommandBot:
             lower_price = alert_data["lower_price"]
             chat_id = alert_data["chat_id"]
 
-            # Upper breach
+            # Upper breach -> trigger ONCE and then deactivate
             if current_price >= upper_price and not self.alert_sent[stock_symbol]["upper_sent"]:
                 msg = (
                     f"🚨 <b>PRICE ALERT - UPPER BREACH</b> 🚨\n\n"
@@ -173,9 +165,14 @@ class TelegramCommandBot:
                     f"Time: {timestamp}"
                 )
                 self.send_message(chat_id, msg)
-                self.alert_sent[stock_symbol]["upper_sent"] = True
 
-            # Lower breach
+                with self.lock:
+                    if stock_symbol in self.alert_sent:
+                        self.alert_sent[stock_symbol]["upper_sent"] = True
+                    if stock_symbol in self.alerts:
+                        self.alerts[stock_symbol]["active"] = False  # ✅ deactivate after trigger
+
+            # Lower breach -> trigger ONCE and then deactivate
             elif current_price <= lower_price and not self.alert_sent[stock_symbol]["lower_sent"]:
                 msg = (
                     f"🚨 <b>PRICE ALERT - LOWER BREACH</b> 🚨\n\n"
@@ -185,36 +182,37 @@ class TelegramCommandBot:
                     f"Time: {timestamp}"
                 )
                 self.send_message(chat_id, msg)
-                self.alert_sent[stock_symbol]["lower_sent"] = True
 
-            # Reset if back in range
-            elif lower_price < current_price < upper_price:
-                if self.alert_sent[stock_symbol]["upper_sent"] or self.alert_sent[stock_symbol]["lower_sent"]:
-                    self.alert_sent[stock_symbol]["upper_sent"] = False
-                    self.alert_sent[stock_symbol]["lower_sent"] = False
+                with self.lock:
+                    if stock_symbol in self.alert_sent:
+                        self.alert_sent[stock_symbol]["lower_sent"] = True
+                    if stock_symbol in self.alerts:
+                        self.alerts[stock_symbol]["active"] = False  # ✅ deactivate after trigger
 
             print(f"[{timestamp}] {stock_symbol}: ₹{current_price} (Range: {lower_price}-{upper_price})")
 
     def monitoring_loop(self) -> None:
-        """Background monitoring loop"""
         self.monitoring_active = True
         print("🔄 Monitoring started")
 
-        while self.alerts:
+        while True:
+            with self.lock:
+                has_active = any(a.get("active") for a in self.alerts.values())
+
+            if not has_active:
+                # Keep process alive; users can add new alerts anytime
+                time.sleep(5)
+                continue
+
             self.check_alerts()
             time.sleep(60)
 
-        self.monitoring_active = False
-        print("⏹️ Monitoring stopped (no alerts)")
-
     def start_monitoring_thread(self) -> None:
-        """Start monitoring in background thread"""
         if not self.monitoring_active:
             t = threading.Thread(target=self.monitoring_loop, daemon=True)
             t.start()
 
     def handle_command(self, chat_id: str, message_text: str) -> None:
-        """Process commands"""
         message_text = message_text.strip()
         self.user_chat_ids.add(chat_id)
 
@@ -230,10 +228,9 @@ class TelegramCommandBot:
                 "❌ /remove STOCK - Remove an alert\n"
                 "   Example: /remove INFY\n\n"
                 "💡 /help - Show this message\n\n"
-                "<b>Notes:</b>\n"
-                "• Uses NSE symbols (e.g., RELIANCE, TCS, INFY)\n"
-                "• Checks every 60 seconds\n"
-                "• Alerts reset if price returns inside range"
+                "<b>How alerts work:</b>\n"
+                "• Each alert triggers ONCE, then becomes inactive\n"
+                "• Use /update (or /add again) to reactivate with new limits"
             )
             self.send_message(chat_id, help_text)
             return
@@ -266,7 +263,8 @@ class TelegramCommandBot:
                     f"Stock: {stock}\n"
                     f"Current Price: ₹{test_price}\n"
                     f"Lower Limit: ₹{lower}\n"
-                    f"Upper Limit: ₹{upper}",
+                    f"Upper Limit: ₹{upper}\n\n"
+                    f"Note: If current price is already outside the range, it may trigger immediately."
                 )
             except ValueError:
                 self.send_message(chat_id, "❌ Prices must be numbers.\nExample: /add INFY 1450 1550")
@@ -288,13 +286,15 @@ class TelegramCommandBot:
                     self.send_message(chat_id, "❌ Lower price must be less than upper price!")
                     return
 
-                if stock not in self.alerts or self.alerts[stock].get("chat_id") != chat_id:
-                    self.send_message(chat_id, f"❌ No alert found for {stock}. Use /add to create one.")
-                    return
+                with self.lock:
+                    if stock not in self.alerts or self.alerts[stock].get("chat_id") != chat_id:
+                        self.send_message(chat_id, f"❌ No alert found for {stock}. Use /add to create one.")
+                        return
 
-                self.alerts[stock]["lower_price"] = lower
-                self.alerts[stock]["upper_price"] = upper
-                self.alert_sent[stock] = {"upper_sent": False, "lower_sent": False}
+                    self.alerts[stock]["lower_price"] = lower
+                    self.alerts[stock]["upper_price"] = upper
+                    self.alerts[stock]["active"] = True  # ✅ reactivate on update
+                    self.alert_sent[stock] = {"upper_sent": False, "lower_sent": False}
 
                 cur = self.get_current_price(f"{stock}.NS")
                 self.send_message(
@@ -303,7 +303,8 @@ class TelegramCommandBot:
                     f"Stock: {stock}\n"
                     f"Current Price: ₹{cur if cur is not None else 'N/A'}\n"
                     f"New Lower Limit: ₹{lower}\n"
-                    f"New Upper Limit: ₹{upper}",
+                    f"New Upper Limit: ₹{upper}\n"
+                    f"Status: Active"
                 )
             except ValueError:
                 self.send_message(chat_id, "❌ Prices must be numbers.\nExample: /update INFY 1440 1560")
@@ -311,16 +312,20 @@ class TelegramCommandBot:
 
         # /list
         if message_text.startswith("/list"):
-            user_alerts = {k: v for k, v in self.alerts.items() if v.get("chat_id") == chat_id}
+            with self.lock:
+                user_alerts = {k: v for k, v in self.alerts.items() if v.get("chat_id") == chat_id}
+
             if not user_alerts:
-                self.send_message(chat_id, "📋 You have no active alerts. Use /add to create one.")
+                self.send_message(chat_id, "📋 You have no alerts. Use /add to create one.")
                 return
 
-            out = "📋 <b>Your Active Alerts:</b>\n\n"
+            out = "📋 <b>Your Alerts:</b>\n\n"
             for stock, a in user_alerts.items():
                 cur = self.get_current_price(a["ticker"])
+                status = "✅ Active" if a.get("active") else "⏸️ Inactive (triggered)"
                 out += (
                     f"<b>{stock}</b>\n"
+                    f"Status: {status}\n"
                     f"Current: {'₹' + str(cur) if cur is not None else 'N/A'}\n"
                     f"Range: ₹{a['lower_price']} - ₹{a['upper_price']}\n\n"
                 )
@@ -335,8 +340,7 @@ class TelegramCommandBot:
                 return
 
             stock = parts[1].upper()
-            if stock in self.alerts and self.alerts[stock].get("chat_id") == chat_id:
-                self.remove_alert(stock)
+            if self.remove_alert(chat_id, stock):
                 self.send_message(chat_id, f"✅ Alert removed for {stock}")
             else:
                 self.send_message(chat_id, f"❌ No alert found for {stock}")
@@ -345,7 +349,6 @@ class TelegramCommandBot:
         self.send_message(chat_id, "❓ Unknown command. Send /help to see commands.")
 
     def run(self) -> None:
-        """Main bot loop"""
         print("🤖 Bot started! Send /help to the bot on Telegram.\n")
 
         while True:
@@ -373,9 +376,7 @@ class TelegramCommandBot:
 
 
 def start_web_server():
-    """
-    Tiny HTTP server so Railway sees an open port and keeps the service healthy.
-    """
+    """Tiny HTTP server so Railway sees an open port and keeps the service healthy."""
     app = Flask(__name__)
 
     @app.get("/")
@@ -399,7 +400,6 @@ def main():
         print("\n❌ ERROR: Please paste your real Telegram bot token in the code.")
         return
 
-    # Start web server for Railway health checks
     threading.Thread(target=start_web_server, daemon=True).start()
 
     bot = TelegramCommandBot(TELEGRAM_BOT_TOKEN)
