@@ -1,18 +1,22 @@
 """
-NSE Stock Alert Bot with Telegram Commands
-Your dad can control everything by just messaging the bot!
+NSE Stock Alert Bot with Telegram Commands (Railway-friendly)
 
 Commands:
-  /add ETERNAL 275 300    - Add alert for ETERNAL stock
-  /update ETERNAL 270 305 - Update alert thresholds
-  /list                   - Show all alerts (for this chat)
-  /remove ETERNAL         - Remove alert
-  /help                   - Show help
+  /add SYMBOL LOWER UPPER
+    Example: /add INFY 1350 1550
+
+  /update SYMBOL LOWER UPPER
+    Example: /update INFY 1340 1560
+
+  /list
+  /remove SYMBOL
+  /help
 
 Behavior:
 - Alerts trigger ONCE (then become inactive)
 - /update re-activates an alert
-- /add ALWAYS adds, even if price feed is temporarily down
+- /add ALWAYS adds (even if price feed is temporarily down)
+- IMPORTANT: Each command sends EXACTLY ONE reply message (no double prompts)
 """
 
 import time
@@ -27,15 +31,18 @@ from flask import Flask
 class TelegramCommandBot:
     def __init__(self, telegram_bot_token: str):
         self.bot_token = telegram_bot_token
+
+        # alerts[symbol] = {ticker, upper_price, lower_price, chat_id, active}
         self.alerts: Dict[str, Dict] = {}
+
+        # alert_sent[symbol] = {upper_sent, lower_sent}
         self.alert_sent: Dict[str, Dict] = {}
+
         self.last_update_id = 0
-
         self.monitoring_active = False
-        self.user_chat_ids = set()
-
-        # Thread-safety for shared dicts
         self.lock = threading.Lock()
+
+    # -------------------- Telegram helpers --------------------
 
     def send_message(self, chat_id: str, message: str) -> bool:
         url = f"https://api.telegram.org/bot{self.bot_token}/sendMessage"
@@ -49,11 +56,7 @@ class TelegramCommandBot:
 
     def get_updates(self):
         url = f"https://api.telegram.org/bot{self.bot_token}/getUpdates"
-        params = {
-          "offset": self.last_update_id + 1,
-          "timeout": 30,
-          "allowed_updates": ["message"]
-        }
+        params = {"offset": self.last_update_id + 1, "timeout": 30, "allowed_updates": ["message"]}
         try:
             r = requests.get(url, params=params, timeout=35)
             if r.status_code == 200:
@@ -62,17 +65,18 @@ class TelegramCommandBot:
             print(f"Error getting updates: {e}")
         return []
 
+    # -------------------- Alerts storage --------------------
+
     def add_alert(self, chat_id: str, stock_symbol: str, lower_price: float, upper_price: float) -> None:
         sym = stock_symbol.upper()
         ticker = f"{sym}.NS"
-
         with self.lock:
             self.alerts[sym] = {
                 "ticker": ticker,
                 "upper_price": upper_price,
                 "lower_price": lower_price,
                 "chat_id": chat_id,
-                "active": True,  # active until it triggers once
+                "active": True,
             }
             self.alert_sent[sym] = {"upper_sent": False, "lower_sent": False}
 
@@ -89,10 +93,12 @@ class TelegramCommandBot:
                 return True
         return False
 
+    # -------------------- Price fetching (Yahoo chart endpoint) --------------------
+
     def get_current_price(self, ticker: str):
         """
         Fetch current price from Yahoo Finance chart endpoint directly.
-        Tries intervals in order: 1m -> 5m -> 15m (fallbacks are more stable on cloud IPs).
+        Tries intervals: 1m -> 5m -> 15m (fallbacks are more stable on cloud IPs).
         """
         url = f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}"
 
@@ -154,6 +160,8 @@ class TelegramCommandBot:
 
         return None
 
+    # -------------------- Monitoring --------------------
+
     def check_alerts(self) -> None:
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
@@ -187,7 +195,7 @@ class TelegramCommandBot:
                     if stock_symbol in self.alert_sent:
                         self.alert_sent[stock_symbol]["upper_sent"] = True
                     if stock_symbol in self.alerts:
-                        self.alerts[stock_symbol]["active"] = False  # ✅ deactivate after trigger
+                        self.alerts[stock_symbol]["active"] = False
 
             # Lower breach -> trigger ONCE then deactivate
             elif current_price <= lower_price and not self.alert_sent.get(stock_symbol, {}).get("lower_sent", False):
@@ -204,7 +212,7 @@ class TelegramCommandBot:
                     if stock_symbol in self.alert_sent:
                         self.alert_sent[stock_symbol]["lower_sent"] = True
                     if stock_symbol in self.alerts:
-                        self.alerts[stock_symbol]["active"] = False  # ✅ deactivate after trigger
+                        self.alerts[stock_symbol]["active"] = False
 
             print(f"[{timestamp}] {stock_symbol}: ₹{current_price} (Range: {lower_price}-{upper_price})")
 
@@ -228,35 +236,34 @@ class TelegramCommandBot:
             t = threading.Thread(target=self.monitoring_loop, daemon=True)
             t.start()
 
-    def handle_command(self, chat_id: str, message_text: str) -> None:
-        message_text = message_text.strip()
-        self.user_chat_ids.add(chat_id)
+    # -------------------- Command handling (ONE reply per command) --------------------
 
-        if message_text.startswith("/start") or message_text.startswith("/help"):
+    def handle_command(self, chat_id: str, message_text: str) -> None:
+        text = message_text.strip()
+        parts = text.split()
+        cmd = parts[0].lower() if parts else ""
+
+        if cmd in ("/start", "/help"):
             help_text = (
                 "🤖 <b>NSE Stock Alert Bot</b>\n\n"
                 "<b>Commands:</b>\n"
                 "➕ /add STOCK LOWER UPPER\n"
-                "   Example: /add INFY 1450 1550\n\n"
+                "   Example: /add INFY 1350 1550\n\n"
                 "✏️ /update STOCK LOWER UPPER\n"
-                "   Example: /update INFY 1440 1560\n\n"
-                "📋 /list - Show all your alerts\n"
-                "❌ /remove STOCK - Remove an alert\n"
-                "   Example: /remove INFY\n\n"
-                "💡 /help - Show this message\n\n"
-                "<b>How alerts work:</b>\n"
-                "• Each alert triggers ONCE, then becomes inactive\n"
-                "• Use /update to reactivate with new limits\n"
-                "• /add always works even if price feed is temporarily down"
+                "   Example: /update INFY 1340 1560\n\n"
+                "📋 /list - Show your alerts\n"
+                "❌ /remove STOCK - Remove an alert\n\n"
+                "<b>Notes:</b>\n"
+                "• Each alert triggers once, then becomes inactive\n"
+                "• /update re-activates an alert\n"
+                "• /add works even if price feed is temporarily unavailable"
             )
             self.send_message(chat_id, help_text)
             return
 
-        # /add STOCK LOWER UPPER  (ALWAYS adds even if test price fails)
-        if message_text.startswith("/add"):
-            parts = message_text.split()
+        if cmd == "/add":
             if len(parts) != 4:
-                self.send_message(chat_id, "❌ Use: /add STOCK LOWER UPPER\nExample: /add INFY 1450 1550")
+                self.send_message(chat_id, "❌ Use: /add STOCK LOWER UPPER\nExample: /add INFY 1350 1550")
                 return
 
             try:
@@ -268,25 +275,23 @@ class TelegramCommandBot:
                     self.send_message(chat_id, "❌ Lower price must be less than upper price!")
                     return
 
-                test_price = self.get_current_price(f"{stock}.NS")
-
-                # ✅ Always add
+                # Always add first
                 self.add_alert(chat_id, stock, lower, upper)
 
+                # Then try to fetch current price (optional)
+                test_price = self.get_current_price(f"{stock}.NS")
+
                 if test_price is None:
-                    self.send_message(
-                        chat_id,
+                    msg = (
                         f"✅ <b>Alert Added!</b>\n\n"
                         f"Stock: {stock}\n"
                         f"Lower Limit: ₹{lower}\n"
                         f"Upper Limit: ₹{upper}\n\n"
-                        f"⚠️ Price feed is temporarily unavailable (Yahoo).\n"
-                        f"The bot will keep checking and will alert when data is available.\n\n"
-                        f"Note: If price is already outside the range, it may trigger immediately once data returns."
+                        f"⚠️ Price feed temporarily unavailable.\n"
+                        f"The bot will keep checking and alert when data is available."
                     )
                 else:
-                    self.send_message(
-                        chat_id,
+                    msg = (
                         f"✅ <b>Alert Added!</b>\n\n"
                         f"Stock: {stock}\n"
                         f"Current Price: ₹{test_price}\n"
@@ -295,15 +300,16 @@ class TelegramCommandBot:
                         f"Note: If current price is already outside the range, it may trigger immediately."
                     )
 
-            except ValueError:
-                self.send_message(chat_id, "❌ Prices must be numbers.\nExample: /add INFY 1450 1550")
-            return
+                self.send_message(chat_id, msg)
+                return
 
-        # /update STOCK LOWER UPPER (reactivates)
-        if message_text.startswith("/update"):
-            parts = message_text.split()
+            except ValueError:
+                self.send_message(chat_id, "❌ Prices must be numbers.\nExample: /add INFY 1350 1550")
+                return
+
+        if cmd == "/update":
             if len(parts) != 4:
-                self.send_message(chat_id, "❌ Use: /update STOCK LOWER UPPER\nExample: /update INFY 1440 1560")
+                self.send_message(chat_id, "❌ Use: /update STOCK LOWER UPPER\nExample: /update INFY 1340 1560")
                 return
 
             try:
@@ -322,12 +328,11 @@ class TelegramCommandBot:
 
                     self.alerts[stock]["lower_price"] = lower
                     self.alerts[stock]["upper_price"] = upper
-                    self.alerts[stock]["active"] = True  # ✅ reactivate on update
+                    self.alerts[stock]["active"] = True
                     self.alert_sent[stock] = {"upper_sent": False, "lower_sent": False}
 
                 cur = self.get_current_price(f"{stock}.NS")
-                self.send_message(
-                    chat_id,
+                msg = (
                     f"✅ <b>Alert Updated!</b>\n\n"
                     f"Stock: {stock}\n"
                     f"Current Price: ₹{cur if cur is not None else 'N/A'}\n"
@@ -335,13 +340,14 @@ class TelegramCommandBot:
                     f"New Upper Limit: ₹{upper}\n"
                     f"Status: Active"
                 )
+                self.send_message(chat_id, msg)
+                return
 
             except ValueError:
-                self.send_message(chat_id, "❌ Prices must be numbers.\nExample: /update INFY 1440 1560")
-            return
+                self.send_message(chat_id, "❌ Prices must be numbers.\nExample: /update INFY 1340 1560")
+                return
 
-        # /list
-        if message_text.startswith("/list"):
+        if cmd == "/list":
             with self.lock:
                 user_alerts = {k: v for k, v in self.alerts.items() if v.get("chat_id") == chat_id}
 
@@ -363,21 +369,22 @@ class TelegramCommandBot:
             self.send_message(chat_id, out)
             return
 
-        # /remove STOCK
-        if message_text.startswith("/remove"):
-            parts = message_text.split()
+        if cmd == "/remove":
             if len(parts) != 2:
                 self.send_message(chat_id, "❌ Use: /remove STOCK\nExample: /remove INFY")
                 return
 
             stock = parts[1].upper()
-            if self.remove_alert(chat_id, stock):
+            removed = self.remove_alert(chat_id, stock)
+            if removed:
                 self.send_message(chat_id, f"✅ Alert removed for {stock}")
             else:
                 self.send_message(chat_id, f"❌ No alert found for {stock}")
             return
 
         self.send_message(chat_id, "❓ Unknown command. Send /help to see commands.")
+
+    # -------------------- Main loop --------------------
 
     def run(self) -> None:
         print("🤖 Bot started! Send /help to the bot on Telegram.\n")
@@ -431,6 +438,7 @@ def main():
         print("\n❌ ERROR: Please paste your real Telegram bot token in the code.")
         return
 
+    # Start tiny web server for Railway health checks
     threading.Thread(target=start_web_server, daemon=True).start()
 
     bot = TelegramCommandBot(TELEGRAM_BOT_TOKEN)
@@ -439,14 +447,8 @@ def main():
     print("\n📱 Telegram steps:")
     print("   1) Open your bot")
     print("   2) Send /start")
-    print("   3) Send /add INFY 1450 1550")
+    print("   3) Send /add INFY 1350 1550")
     print("\n" + "=" * 60 + "\n")
-
-    # Drop any pending updates on startup to prevent duplicate processing
-    requests.get(
-      f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates",
-      params={"offset": -1}
-    )
 
     bot.run()
 
