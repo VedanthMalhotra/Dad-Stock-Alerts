@@ -10,7 +10,6 @@ Commands:
   /help                  - Show help
 """
 
-import yfinance as yf
 import requests
 import time
 import threading
